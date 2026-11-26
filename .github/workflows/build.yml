@@ -107,6 +107,7 @@ jobs:
 
             "-DWITH_CLIENT_COMMON=ON",
             "-DWITH_CLIENT=OFF",
+            "-DCHANNEL_URBDRC=OFF",
 
             "-DWITH_SERVER=ON",
             "-DWITH_SHADOW=ON",
