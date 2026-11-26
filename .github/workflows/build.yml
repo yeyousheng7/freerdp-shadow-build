@@ -1,0 +1,208 @@
+
+name: Build FreeRDP Shadow CLI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build.yml"
+
+  workflow_dispatch:
+    inputs:
+      freerdp_ref:
+        description: "FreeRDP tag, branch, or commit"
+        required: true
+        default: "3.33.1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 / MSVC
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout build configuration
+        uses: actions/checkout@v4
+
+      - name: Resolve FreeRDP version
+        id: version
+        shell: pwsh
+        env:
+          REQUESTED_REF: ${{ inputs.freerdp_ref }}
+        run: |
+          $ref = $env:REQUESTED_REF
+          if ([string]::IsNullOrWhiteSpace($ref)) {
+            $ref = "3.33.1"
+          }
+          "ref=$ref" >> $env:GITHUB_OUTPUT
+          Write-Host "Building FreeRDP: $ref"
+
+      - name: Checkout upstream FreeRDP
+        uses: actions/checkout@v4
+        with:
+          repository: FreeRDP/FreeRDP
+          ref: ${{ steps.version.outputs.ref }}
+          path: freerdp
+          fetch-depth: 1
+
+      - name: Locate vcpkg
+        shell: pwsh
+        run: |
+          $candidates = @(
+            $env:VCPKG_INSTALLATION_ROOT,
+            "C:\vcpkg"
+          )
+
+          $vcpkgRoot = $candidates |
+            Where-Object {
+              $_ -and (Test-Path (Join-Path $_ "vcpkg.exe"))
+            } |
+            Select-Object -First 1
+
+          if (-not $vcpkgRoot) {
+            throw "vcpkg.exe not found."
+          }
+
+          "VCPKG_ROOT=$vcpkgRoot" >> $env:GITHUB_ENV
+          Write-Host "VCPKG_ROOT=$vcpkgRoot"
+
+      - name: Install static dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            openssl:x64-windows-static `
+            zlib:x64-windows-static `
+            --disable-metrics
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Configure FreeRDP
+        shell: pwsh
+        run: |
+          $cmakeArgs = @(
+            "-S", "freerdp",
+            "-B", "build",
+            "-G", "Visual Studio 17 2022",
+            "-A", "x64",
+
+            "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake",
+            "-DVCPKG_TARGET_TRIPLET=x64-windows-static",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+
+            "-DBUILD_SHARED_LIBS=OFF",
+
+            "-DWITH_OPENSSL=ON",
+            "-DWITH_JSON_DISABLED=ON",
+
+            "-DWITH_FFMPEG=OFF",
+            "-DWITH_SWSCALE=OFF",
+            "-DWITH_CAIRO=OFF",
+            "-DWITH_SAMPLE=OFF",
+
+            "-DWITH_CLIENT_COMMON=ON",
+            "-DWITH_CLIENT=OFF",
+
+            "-DWITH_SERVER=ON",
+            "-DWITH_SHADOW=ON",
+            "-DWITH_SHADOW_SUBSYSTEM=ON",
+            "-DWITH_SHADOW_WIN_DXGI=ON",
+            "-DWITH_SERVER_SHADOW_CLI=ON",
+            "-DWITH_SHADOW_WIN_SERVICE=OFF",
+
+            "-DWITH_PROXY=OFF",
+            "-DWITH_PLATFORM_SERVER=OFF",
+            "-DWITH_WINPR_TOOLS=OFF",
+            "-DWITH_MANPAGES=OFF",
+
+            "-DCMAKE_WINDOWS_VERSION=WIN8",
+            "-DWITH_WIN8=ON"
+          )
+
+          cmake @cmakeArgs
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Build Shadow CLI
+        shell: pwsh
+        run: |
+          cmake --build build `
+            --config Release `
+            --target freerdp-shadow-cli `
+            --parallel 2
+
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+      - name: Package executable
+        shell: pwsh
+        env:
+          FREERDP_REF: ${{ steps.version.outputs.ref }}
+        run: |
+          $exe = Get-ChildItem `
+            -Path "build" `
+            -Filter "freerdp-shadow-cli.exe" `
+            -File -Recurse |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "freerdp-shadow-cli.exe was not produced."
+          }
+
+          New-Item -ItemType Directory -Force `
+            -Path "dist\LICENSES" | Out-Null
+
+          Copy-Item $exe.FullName `
+            "dist\freerdp-shadow-cli.exe"
+
+          Copy-Item "freerdp\LICENSE" `
+            "dist\LICENSES\LICENSE-FreeRDP.txt"
+
+          $licenses = @(
+            @{
+              Source = "$env:VCPKG_ROOT\installed\x64-windows-static\share\openssl\copyright"
+              Target = "dist\LICENSES\LICENSE-OpenSSL.txt"
+            },
+            @{
+              Source = "$env:VCPKG_ROOT\installed\x64-windows-static\share\zlib\copyright"
+              Target = "dist\LICENSES\LICENSE-zlib.txt"
+            }
+          )
+
+          foreach ($item in $licenses) {
+            if (Test-Path $item.Source) {
+              Copy-Item $item.Source $item.Target
+            }
+          }
+
+          @(
+            "FreeRDP Shadow CLI"
+            "Source: https://github.com/FreeRDP/FreeRDP"
+            "Ref: $env:FREERDP_REF"
+            "Target: freerdp-shadow-cli"
+            "Architecture: x64"
+            "Configuration: Release"
+            "Linkage: Static"
+            "Capture: DXGI Desktop Duplication"
+            "Shadow Service: Disabled"
+          ) | Set-Content -Encoding utf8 "dist\BUILD-INFO.txt"
+
+          Get-ChildItem -Recurse "dist" |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: freerdp-shadow-cli-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
